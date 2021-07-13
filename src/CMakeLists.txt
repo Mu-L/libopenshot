@@ -86,6 +86,7 @@ set(OPENSHOT_SOURCES
   FrameMapper.cpp
   Json.cpp
   KeyFrame.cpp
+  TrackedObjectBase.cpp
   OpenShotVersion.cpp
   ZmqLogger.cpp
   PlayerBase.cpp
@@ -105,6 +106,7 @@ set(OPENSHOT_CV_SOURCES
   CVStabilization.cpp
   ClipProcessingJobs.cpp
   CVObjectDetection.cpp
+  TrackedObjectBBox.cpp
   effects/Stabilizer.cpp
   effects/Tracker.cpp
   effects/ObjectDetection.cpp
@@ -184,55 +186,56 @@ target_link_libraries(openshot PUBLIC OpenShot::Audio)
 ###
 
 # Find the ImageMagick++ library
-find_package(ImageMagick COMPONENTS Magick++ MagickWand MagickCore)
+if (ENABLE_MAGICK)
+  find_package(ImageMagick COMPONENTS Magick++ MagickCore)
 
-if(ImageMagick_FOUND)
-  if(NOT TARGET ImageMagick::Magick++ AND NOT TARGET Magick++_TARGET)
-    add_library(Magick++_TARGET INTERFACE)
+  if(ImageMagick_FOUND)
+    if(NOT TARGET ImageMagick::Magick++ AND NOT TARGET Magick++_TARGET)
+      add_library(Magick++_TARGET INTERFACE)
 
-    # Include ImageMagick++ headers (needed for compile)
-    set_property(TARGET Magick++_TARGET APPEND PROPERTY
-      INTERFACE_INCLUDE_DIRECTORIES ${ImageMagick_INCLUDE_DIRS})
+      # Include ImageMagick++ headers (needed for compile)
+      set_property(TARGET Magick++_TARGET APPEND PROPERTY
+        INTERFACE_INCLUDE_DIRECTORIES ${ImageMagick_INCLUDE_DIRS})
 
-    # Set the Quantum Depth that ImageMagick was built with (default to 16 bits)
-    if(NOT DEFINED MAGICKCORE_QUANTUM_DEPTH)
-      set(MAGICKCORE_QUANTUM_DEPTH 16)
+      # Set the Quantum Depth that ImageMagick was built with (default to 16 bits)
+      if(NOT DEFINED MAGICKCORE_QUANTUM_DEPTH)
+        set(MAGICKCORE_QUANTUM_DEPTH 16)
+      endif()
+      if(NOT DEFINED MAGICKCORE_HDRI_ENABLE)
+        set(MAGICKCORE_HDRI_ENABLE 0)
+      endif()
+
+      set_property(TARGET Magick++_TARGET APPEND PROPERTY
+        INTERFACE_COMPILE_DEFINITIONS
+          MAGICKCORE_QUANTUM_DEPTH=${MAGICKCORE_QUANTUM_DEPTH})
+      set_property(TARGET Magick++_TARGET APPEND PROPERTY
+        INTERFACE_COMPILE_DEFINITIONS
+          MAGICKCORE_HDRI_ENABLE=${MAGICKCORE_HDRI_ENABLE})
+
+      target_link_libraries(Magick++_TARGET INTERFACE
+        ${ImageMagick_LIBRARIES})
+
+      # Alias to our namespaced name
+      add_library(ImageMagick::Magick++ ALIAS Magick++_TARGET)
+
     endif()
-    if(NOT DEFINED MAGICKCORE_HDRI_ENABLE)
-      set(MAGICKCORE_HDRI_ENABLE 0)
-    endif()
 
-    set_property(TARGET Magick++_TARGET APPEND PROPERTY
-      INTERFACE_COMPILE_DEFINITIONS
-        MAGICKCORE_QUANTUM_DEPTH=${MAGICKCORE_QUANTUM_DEPTH})
-    set_property(TARGET Magick++_TARGET APPEND PROPERTY
-      INTERFACE_COMPILE_DEFINITIONS
-        MAGICKCORE_HDRI_ENABLE=${MAGICKCORE_HDRI_ENABLE})
+    # Add optional ImageMagic-dependent sources
+    target_sources(openshot PRIVATE
+      ImageReader.cpp
+      ImageWriter.cpp
+      TextReader.cpp)
 
-    target_link_libraries(Magick++_TARGET INTERFACE
-      ${ImageMagick_LIBRARIES})
+    # define a preprocessor macro (used in the C++ source)
+    target_compile_definitions(openshot PUBLIC USE_IMAGEMAGICK=1)
 
-    # Alias to our namespaced name
-    add_library(ImageMagick::Magick++ ALIAS Magick++_TARGET)
+    # Link with ImageMagick library
+    target_link_libraries(openshot PUBLIC ImageMagick::Magick++)
 
+    set(HAVE_IMAGEMAGICK TRUE CACHE BOOL "Building with ImageMagick support" FORCE)
+    mark_as_advanced(HAVE_IMAGEMAGICK)
   endif()
-
-  # Add optional ImageMagic-dependent sources
-  target_sources(openshot PRIVATE
-    ImageReader.cpp
-    ImageWriter.cpp
-    TextReader.cpp)
-
-  # define a preprocessor macro (used in the C++ source)
-  target_compile_definitions(openshot PUBLIC USE_IMAGEMAGICK=1)
-
-  # Link with ImageMagick library
-  target_link_libraries(openshot PUBLIC ImageMagick::Magick++)
-
-  set(HAVE_IMAGEMAGICK TRUE CACHE BOOL "Building with ImageMagick support" FORCE)
-  mark_as_advanced(HAVE_IMAGEMAGICK)
 endif()
-
 
 ################### JSONCPP #####################
 # Include jsoncpp headers (needed for JSON parsing)
@@ -246,10 +249,12 @@ endif ()
 if (NOT jsoncpp_FOUND AND NOT DISABLE_BUNDLED_JSONCPP)
   message(STATUS "Using embedded jsoncpp (not found or USE_SYSTEM_JSONCPP disabled)")
   if (NOT TARGET jsoncpp_lib)
-    add_library(jsoncpp_lib INTERFACE)
-    target_include_directories(jsoncpp_lib INTERFACE
+    add_library(jsoncpp_lib OBJECT)
+    set_target_properties(jsoncpp_lib PROPERTIES
+      POSITION_INDEPENDENT_CODE TRUE)
+    target_include_directories(jsoncpp_lib PUBLIC
       "${PROJECT_SOURCE_DIR}/thirdparty/jsoncpp")
-    target_sources(jsoncpp_lib INTERFACE "${PROJECT_SOURCE_DIR}/thirdparty/jsoncpp/jsoncpp.cpp")
+    target_sources(jsoncpp_lib PRIVATE "${PROJECT_SOURCE_DIR}/thirdparty/jsoncpp/jsoncpp.cpp")
     # Because this satisfies the requirement, an installed JsonCpp is optional
     set_package_properties(jsoncpp PROPERTIES TYPE OPTIONAL)
   endif ()
@@ -284,23 +289,70 @@ mark_as_advanced(QT_VERSION_STR)
 
 ################### FFMPEG #####################
 # Find FFmpeg libraries (used for video encoding / decoding)
-find_package(FFmpeg REQUIRED COMPONENTS avcodec avdevice avformat avutil swscale)
+find_package(FFmpeg REQUIRED
+  COMPONENTS avcodec avformat avutil swscale
+  OPTIONAL_COMPONENTS swresample avresample
+)
 
-set(all_comps avcodec avdevice avformat avfilter avutil postproc swscale swresample avresample)
+set(all_comps avcodec avformat avutil swscale)
 set(version_comps avcodec avformat avutil)
+
+# Pick a resampler.  Prefer swresample if possible
+if(TARGET FFmpeg::swresample AND ${FFmpeg_avformat_VERSION} VERSION_GREATER "57.0.0")
+  set(resample_lib swresample)
+  set(USE_SW TRUE)
+else()
+  set(resample_lib avresample)
+  set(USE_SW FALSE)
+endif()
+list(APPEND all_comps ${resample_lib})
 
 foreach(ff_comp IN LISTS all_comps)
   if(TARGET FFmpeg::${ff_comp})
     target_link_libraries(openshot PUBLIC FFmpeg::${ff_comp})
     # Keep track of some FFmpeg lib versions, to embed in our version header
-    if(${ff_comp} IN_LIST version_comps)
+    if(${ff_comp} IN_LIST version_comps AND FFmpeg_${ff_comp}_VERSION)
       string(TOUPPER ${ff_comp} v_name)
-      set(${v_name}_VERSION_STR ${${ff_comp}_VERSION} CACHE STRING "${ff_comp} version used" FORCE)
+      set(${v_name}_VERSION_STR ${FFmpeg_${ff_comp}_VERSION} CACHE STRING "${ff_comp} version used" FORCE)
       mark_as_advanced(${v_name}_VERSION_STR)
     endif()
   endif()
-
 endforeach()
+
+# Indicate which resampler we linked with, and set a config header flag
+add_feature_info("FFmpeg ${resample_lib}" TRUE "Audio resampling uses ${resample_lib}")
+# Set the appropriate flag in OpenShotVersion.h
+set(FFMPEG_USE_SWRESAMPLE ${USE_SW} CACHE BOOL "libswresample used for audio resampling" FORCE)
+mark_as_advanced(FFMPEG_USE_SWRESAMPLE)
+
+# Version check for hardware-acceleration code
+if(USE_HW_ACCEL AND FFmpeg_avcodec_VERSION)
+  if(${FFmpeg_avcodec_VERSION} VERSION_GREATER "57.106")
+    set(HAVE_HW_ACCEL TRUE)
+  endif()
+endif()
+
+# Hwaccel preprocessor define (for source #ifdefs)
+if (NOT USE_HW_ACCEL)
+  target_compile_definitions(openshot PUBLIC USE_HW_ACCEL=0)
+elseif (HAVE_HW_ACCEL)
+  target_compile_definitions(openshot PUBLIC USE_HW_ACCEL=1)
+endif()
+
+# Include in feature summary
+if(USE_HW_ACCEL AND HAVE_HW_ACCEL)
+  set(FFMPEG_HARDWARE_ACCELERATION TRUE)
+elseif(USE_HW_ACCEL)
+  set(FFMPEG_HARDWARE_ACCELERATION "NOTFOUND")
+else()
+  set(FFMPEG_HARDWARE_ACCELERATION FALSE)
+endif()
+
+# Report HWAccel status, unless it's indeterminate
+if (NOT FFMPEG_HARDWARE_ACCELERATION STREQUAL "NOTFOUND")
+  set(_hwaccel_help "GPU-accelerated routines (FFmpeg 3.4+)")
+  add_feature_info("FFmpeg hwaccel" FFMPEG_HARDWARE_ACCELERATION ${_hwaccel_help})
+endif()
 
 ################### OPENMP #####################
 # Check for OpenMP (used for multi-core processing)
@@ -395,8 +447,8 @@ if(ENABLE_OPENCV)
     set(ENABLE_OPENCV FALSE CACHE BOOL
       "Build with OpenCV algorithms (requires Protobuf 3)" FORCE)
     # If we have version 4.5.1, all hope is lost
-  elseif(OpenCV_VERSION VERSION_EQUAL 4.5.1)
-    message(SEND_ERROR [[Incompatible OpenCV version detected
+  elseif(OpenCV_VERSION VERSION_EQUAL "4.5.1")
+    message(WARNING [[Incompatible OpenCV version detected
 OpenCV version 4.5.1 contains header errors which make it unable to be used with OpenShot. OpenCV support wil be disabled. Upgrade to OpenCV 4.5.2+ or downgrade to 4.5.0 or earlier, to enable OpenCV.
 See https://github.com/opencv/opencv/issues/19260]])
     set(ENABLE_OPENCV FALSE CACHE BOOL
@@ -424,7 +476,7 @@ See https://github.com/opencv/opencv/issues/19260]])
     mark_as_advanced(OPENCV_VERSION_STR)
 
     # We may need to use Tracker as opencv::legacy::Tracker
-    if(OpenCV_VERSION VERSION_GREATER_EQUAL 4.5.2)
+    if(OpenCV_VERSION VERSION_GREATER "4.5.1")
       target_compile_definitions(openshot PUBLIC USE_LEGACY_TRACKER=1)
     endif()
 
